@@ -8,6 +8,6 @@ sudo apt-get install -y python3-venv python3-pip
 chmod +x /root/vpn_bot_admin.py
 source /opt/vpn-bot/.venv/bin/activate
 sudo -E /opt/vpn-bot/.venv/bin/python /root/vpn_bot_admin.py
-danilabaxbax@MacBook-Pro-Daniil-2 Desktop % 
+
 
 
