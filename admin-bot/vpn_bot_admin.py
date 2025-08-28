@@ -48,7 +48,7 @@ CLIENTS_DIR = Path("/etc/wireguard/clients")
 
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
-    "7927839580:AAE1GOB57eZJy0u1qL6hz33jc68IoBowEPg"  # ENV имеет приоритет
+    "Your_token"  # ENV имеет приоритет
 ).strip()
 
 # Ограничение доступа: ADMIN_IDS="123,456" (опционально)
