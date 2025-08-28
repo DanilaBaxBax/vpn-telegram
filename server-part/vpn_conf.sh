@@ -1,9 +1,10 @@
+
 #!/usr/bin/env bash
 # WireGuard server bootstrap + user management (Debian/Ubuntu, systemd)
 # Usage:
 #   ./vpn_setup.sh install [--iface wg0] [--port 51820] [--subnet 10.8.0.0/24] [--dns 1.1.1.1,9.9.9.9]
 #   ./vpn_setup.sh add <username> [--ip 10.8.0.X] [--qr] [--ipv6]
-#   ./vpn_setup.sh revoke <username>
+#   ./vpn_setup.sh revoke <username> [--keep] [--purge]
 #   ./vpn_setup.sh list
 #   ./vpn_setup.sh show <username> [--qr]
 #   ./vpn_setup.sh export <username> [--path /root]
@@ -49,6 +50,13 @@ parse_args_export(){ [[ $# -lt 1 ]] && err "Usage: export <username> [--path /ro
     --path) OUTDIR="$2"; shift 2;;
     *) err "Unknown arg for export: $1";; esac; done; }
 
+parse_args_revoke(){ [[ $# -lt 1 ]] && err "Usage: revoke <username> [--keep] [--purge]";
+  USERNAME="$1"; shift; PURGE=1  # по умолчанию удаляем папку клиента
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --keep)  PURGE=0; shift;;
+    --purge) PURGE=1; shift;;
+    *) err "Unknown arg for revoke: $1";; esac; done; }
+
 # ---------- HELPERS ----------
 ensure_deps(){ if cmd_exists apt-get; then
   export DEBIAN_FRONTEND=noninteractive; apt-get update -y;
@@ -85,12 +93,9 @@ preflight_server_ready(){
 
 sanitize_conf_file(){ # strip BOM/CR and weird spaces inplace
   local f="$1"
-  # strip BOM
   perl -i -pe 'BEGIN{binmode(STDIN);binmode(STDOUT)} s/^\xEF\xBB\xBF//' "$f" 2>/dev/null || true
-  # strip CR
   sed -i 's/\r$//' "$f" 2>/dev/null || true
-  # normalize spaces around comma in AllowedIPs
-  sed -i -E 's/^(AllowedIPs = 0\\.0\\.0\\.0\\/0),\\s*::\\/0/\\1,::\\/0/' "$f" 2>/dev/null || true
+  sed -i -E 's/^(AllowedIPs = 0\.0\.0\.0\/0),\s*::\/0/\1, ::\/0/' "$f" 2>/dev/null || true
 }
 
 # ---------- COMMANDS ----------
@@ -118,24 +123,32 @@ CFG
 
 add_client(){
   parse_args_add "$@"; require_root; preflight_server_ready
-  # validator
+
   lint_conf(){ local f="$1"; wg-quick strip "$f" >/dev/null 2>&1 || err "Синтаксическая ошибка в сгенерированном конфиге ($f)."; }
 
   local IFACE="$(detect_iface)"; local SUBNET="$(detect_subnet)"; local DNS="$(detect_dns)"
   local peer_dir="$CLIENTS_DIR/$USERNAME"
 
-  # idempotent reuse
-  if [[ -d "$peer_dir" ]]; then
-    warn "Client exists: $USERNAME — reusing existing config"
-    if [[ -f "$peer_dir/$USERNAME.conf" ]]; then
-      sanitize_conf_file "$peer_dir/$USERNAME.conf"
-      if cmd_exists qrencode && [[ ! -f "$peer_dir/qr.png" ]]; then qrencode -t PNG -o "$peer_dir/qr.png" <"$peer_dir/$USERNAME.conf" || true; fi
-      log "Config: $peer_dir/$USERNAME.conf"
-      (( ADD_QR )) && cmd_exists qrencode && qrencode -t ANSIUTF8 <"$peer_dir/$USERNAME.conf"
-      return 0
-    else err "Client dir exists but config missing: $peer_dir/$USERNAME.conf"; fi
+  # Если папка клиента уже есть — реактивируем peer и возвращаем конфиг
+  if [[ -d "$peer_dir" && -f "$peer_dir/$USERNAME.conf" ]]; then
+    local cpub="$peer_dir/public.key" psk="$peer_dir/psk.key" conf="$peer_dir/$USERNAME.conf"
+    [[ -f "$cpub" && -f "$psk" ]] || err "Неполный клиентский набор ключей в $peer_dir"
+    # выясняем IP
+    local ip="$(awk -F'AllowedIPs *= *' '/AllowedIPs/{sub(/\/32.*/,"",$2); print $2; exit}' "$peer_dir/peer.conf" 2>/dev/null || true)"
+    [[ -n "$ip" ]] || ip="$(awk -F'= *' '/^Address/{sub(/\/32.*/,"",$2); gsub(/ /,"",$2); print $2}' "$conf" 2>/dev/null || true)"
+    [[ -n "$ip" ]] || err "Не удалось определить IP клиента в $peer_dir"
+    # реактивация peer
+    wg set "$IFACE" peer "$(cat "$cpub")" preshared-key "$psk" allowed-ips "$ip/32"
+    wg-quick save "$IFACE" >/dev/null 2>&1 || true
+    sanitize_conf_file "$conf"
+    if cmd_exists qrencode && [[ ! -f "$peer_dir/qr.png" ]]; then qrencode -t PNG -o "$peer_dir/qr.png" <"$conf" || true; fi
+    (( ADD_QR )) && cmd_exists qrencode && qrencode -t ANSIUTF8 <"$conf"
+    log "Client exists: $USERNAME — re-activated with IP $ip"
+    log "Config: $peer_dir/$USERNAME.conf"
+    return 0
   fi
 
+  # Создание нового клиента
   mkdir -p "$peer_dir"; chmod 700 "$peer_dir"; umask 077
   local cpriv="$peer_dir/private.key" cpub="$peer_dir/public.key" psk="$peer_dir/psk.key"
   wg genkey >"$cpriv"; wg pubkey <"$cpriv" >"$cpub"; wg genpsk >"$psk"
@@ -187,15 +200,26 @@ PEER
 }
 
 revoke_client(){
-  require_root; [[ $# -ne 1 ]] && err "Usage: revoke <username>"; local USERNAME="$1"
+  parse_args_revoke "$@"; require_root
   local IFACE="$(detect_iface)"; local peer_dir="$CLIENTS_DIR/$USERNAME"
-  [[ ! -d "$peer_dir" ]] && err "No such client: $USERNAME"
-  local cpub="$peer_dir/public.key"; [[ ! -f "$cpub" ]] && err "Missing $cpub"
-  wg set "$IFACE" peer "$(cat "$cpub")" remove || warn "Peer already absent at runtime"
-  local ip="$(awk -F'AllowedIPs *= *' '/AllowedIPs/{print $2; exit}' "$peer_dir/peer.conf" 2>/dev/null || true)"
-  if [[ -n "$ip" ]]; then sed -i.bak "/$ip/d" "$WG_DIR/$IFACE.conf" || true; sed -i "/$(sed 's:[]\[^$.*/]:\\&:g' "$cpub")/d" "$WG_DIR/$IFACE.conf" || true; fi
+  if [[ ! -d "$peer_dir" ]]; then
+    warn "No local directory for client: $USERNAME — пытаюсь удалить peer по имени."
+  fi
+  local cpub="$peer_dir/public.key"
+  if [[ -f "$cpub" ]]; then
+    wg set "$IFACE" peer "$(cat "$cpub")" remove || warn "Peer already absent at runtime"
+  else
+    warn "public.key не найден — пропускаю wg remove (возможно, уже удалён)"
+  fi
+  # Пересохранить конфиг интерфейса из runtime (удалит блоки удалённых peer'ов)
   wg-quick save "$IFACE" >/dev/null 2>&1 || true
-  log "Revoked $USERNAME. Files kept in $peer_dir (delete manually if desired)."
+  if [[ ${PURGE:-1} -eq 1 && -d "$peer_dir" ]]; then
+    rm -rf -- "$peer_dir"
+    log "Removed client directory: $peer_dir"
+  else
+    log "Client files kept in: $peer_dir"
+  fi
+  log "Revoked $USERNAME."
 }
 
 list_clients(){
@@ -208,8 +232,7 @@ list_clients(){
     local pub="$(cat "$d/public.key" 2>/dev/null | cut -c1-16)"
     printf "%s %s %s...\n" "$name" "${ip:-?}" "${pub:-}"
   done | column -t
-  echo; echo "Active peers (wg show):"
-  wg show "$IFACE" peers 2>/dev/null || true
+  echo; echo "Active peers (wg show):"; wg show "$IFACE" peers 2>/dev/null || true
 }
 
 show_client(){
@@ -234,7 +257,7 @@ WireGuard server bootstrap + user management
 Commands:
   install [--iface wg0] [--port 51820] [--subnet 10.8.0.0/24] [--dns 1.1.1.1,9.9.9.9]
   add <username> [--ip 10.8.0.X] [--qr] [--ipv6]
-  revoke <username>
+  revoke <username> [--keep] [--purge]
   list
   show <username> [--qr]
   export <username> [--path /root]
@@ -257,3 +280,4 @@ main(){
   esac
 }
 main "$@"
+
