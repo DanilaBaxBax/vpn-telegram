@@ -4,23 +4,23 @@
 """
 Telegram-бот для управления WireGuard через /root/vpn_setup.sh
 
-Особенности UI:
+UI:
 - Пагинация списка клиентов (12 на страницу), переключатель Активные/Все.
-- Список и карточки редактируются в одном сообщении (минимум спама).
 - Поиск: /find <mask>
-- Карточка клиента: Скачать .conf / Скачать QR / Удалить (с подтверждением) / Назад.
+- Карточка клиента: .conf / QR / 📊 Статистика / Удалить (с подтверждением) / ← Назад.
+- Общая статистика: /stats или кнопка «📈 Общая статистика» внизу списка.
+- Все вызовы bash-скрипта идут через /bin/bash.
 
 Команды:
-  /list [active|all] [page]   — список клиентов
-  /find <mask>                — поиск по имени
+  /list [active|all] [page]
+  /find <mask>
   /add <username> [--ip 10.8.0.X] [--ipv6]
   /revoke <username>
   /getconf <username>
   /getqr <username>
-  /show <username>            — показать замаскированный конфиг
+  /show <username>
+  /stats
   /whoami
-
-Зависимости: python-telegram-bot==20.7
 """
 
 import asyncio
@@ -30,9 +30,10 @@ import os
 import re
 import shlex
 import subprocess
+from datetime import datetime
 from glob import glob
 from pathlib import Path
-from typing import Iterable, List, Sequence, Set, Tuple
+from typing import Iterable, List, Sequence, Set, Tuple, Optional, Dict
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
@@ -42,31 +43,27 @@ from telegram.ext import (
 )
 
 # ---------- Настройки ----------
-VPN_SCRIPT = Path("/root/vpn_conf.sh")  # если у тебя файл /root/vpn_conf.sh — сделай симлинк на это имя
-BASH = os.environ.get("BASH", "/bin/bash")  # запускаем скрипт через bash
+VPN_SCRIPT = Path("/root/vpn_setup.sh")  # если другой файл — сделай симлинк на это имя
+BASH = os.environ.get("BASH", "/bin/bash")  # всегда запускаем скрипт через bash
 CLIENTS_DIR = Path("/etc/wireguard/clients")
 
 BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
-    "Your_token"  # ENV имеет приоритет
+    "Your_Token"  # ENV имеет приоритет
 ).strip()
 
-# Ограничение доступа: ADMIN_IDS="123,456" (опционально)
+# ограничение доступа (опционально): ADMIN_IDS="123,456"
 _ADMIN_ENV = os.environ.get("ADMIN_IDS", "").strip()
 ADMIN_IDS = {int(x) for x in _ADMIN_ENV.split(",") if x.strip().isdigit()} if _ADMIN_ENV else set()
 
 PAGE_SIZE = 12
+ONLINE_WINDOW = 300  # секунд, считаем «онлайн», если рукопожатие было <= 5 мин назад
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("vpn-bot")
 
-
 # ---------- Утилиты ----------
-def assert_token():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан")
-
 def is_admin(update: Update) -> bool:
     if not ADMIN_IDS:
         return True
@@ -76,7 +73,7 @@ def is_admin(update: Update) -> bool:
 def validate_username(u: str) -> bool:
     return bool(USERNAME_RE.fullmatch(u))
 
-async def run_cmd(args: Sequence[str], timeout: int = 120) -> subprocess.CompletedProcess:
+async def run_cmd(args: Sequence[str], timeout: int = 180) -> subprocess.CompletedProcess:
     log.debug("RUN: %s", " ".join(shlex.quote(a) for a in args))
     return await asyncio.to_thread(
         subprocess.run,
@@ -88,13 +85,34 @@ async def run_cmd(args: Sequence[str], timeout: int = 120) -> subprocess.Complet
         check=False,
     )
 
-async def run_script(script_args: Sequence[str], timeout: int = 180) -> subprocess.CompletedProcess:
-    # Всегда через bash — надёжнее
+async def run_script(script_args: Sequence[str], timeout: int = 240) -> subprocess.CompletedProcess:
     return await run_cmd([BASH, str(VPN_SCRIPT), *script_args], timeout=timeout)
 
 def detect_iface() -> str:
     files = sorted(glob("/etc/wireguard/*.conf"))
     return Path(files[0]).stem if files else "wg0"
+
+def client_dir(username: str) -> Path:
+    return CLIENTS_DIR / username
+
+def client_conf_path(username: str) -> Path:
+    return client_dir(username) / f"{username}.conf"
+
+def client_pubkey_path(username: str) -> Path:
+    return client_dir(username) / "public.key"
+
+def client_qr_path(username: str) -> Path:
+    return client_dir(username) / "qr.png"
+
+def list_all_clients_fs() -> List[str]:
+    if not CLIENTS_DIR.exists():
+        return []
+    names: List[str] = []
+    for d in CLIENTS_DIR.iterdir():
+        if d.is_dir() and validate_username(d.name) and (d / f"{d.name}.conf").exists():
+            names.append(d.name)
+    names.sort(key=str.lower)
+    return names
 
 async def get_active_peer_keys() -> Tuple[str, Set[str]]:
     iface = detect_iface()
@@ -107,31 +125,12 @@ async def get_active_peer_keys() -> Tuple[str, Set[str]]:
                 keys.add(token)
     return iface, keys
 
-def client_conf_path(username: str) -> Path:
-    return CLIENTS_DIR / username / f"{username}.conf"
-
-def client_pubkey_path(username: str) -> Path:
-    return CLIENTS_DIR / username / "public.key"
-
-def client_qr_path(username: str) -> Path:
-    return CLIENTS_DIR / username / "qr.png"
-
-def list_all_clients_fs() -> List[str]:
-    if not CLIENTS_DIR.exists():
-        return []
-    names: List[str] = []
-    for d in CLIENTS_DIR.iterdir():
-        if d.is_dir() and validate_username(d.name) and (d / f"{d.name}.conf").exists():
-            names.append(d.name)
-    names.sort(key=str.lower)
-    return names
-
 async def list_active_clients() -> List[str]:
-    iface, active_keys = await get_active_peer_keys()
+    _, peer_keys = await get_active_peer_keys()
     names: List[str] = []
     for name in list_all_clients_fs():
         pub = client_pubkey_path(name)
-        if pub.exists() and pub.read_text().strip() in active_keys:
+        if pub.exists() and pub.read_text().strip() in peer_keys:
             names.append(name)
     return names
 
@@ -140,6 +139,31 @@ def paginate(items: Sequence[str], page: int, size: int) -> Sequence[str]:
     end = start + size
     return items[start:end]
 
+def human_bytes(n: int) -> str:
+    s = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if s < 1024.0 or unit == "TB":
+            return f"{s:.2f} {unit}"
+        s /= 1024.0
+    return f"{n} B"
+
+def fmt_dt(ts: float) -> str:
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_age(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if d: parts.append(f"{d}д")
+    if h: parts.append(f"{h}ч")
+    if m: parts.append(f"{m}м")
+    if not parts: parts.append(f"{s}с")
+    return " ".join(parts)
+
+# ---------- Разметка ----------
 def build_list_markup(items: Sequence[str], page: int, total_pages: int, scope: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for name in items:
@@ -151,6 +175,9 @@ def build_list_markup(items: Sequence[str], page: int, total_pages: int, scope: 
         nav.append(InlineKeyboardButton("Дальше »", callback_data=f"list:{scope}:{page+1}"))
     if nav:
         rows.append(nav)
+    # общая статистика
+    rows.append([InlineKeyboardButton("📈 Общая статистика", callback_data=f"gstats:{scope}:{page}")])
+    # переключатель область
     toggle_scope = "all" if scope == "active" else "active"
     rows.append([InlineKeyboardButton(f"Показать: {('Активные' if scope=='active' else 'Все')} ▸ сменить",
                                       callback_data=f"list:{toggle_scope}:1")])
@@ -159,11 +186,12 @@ def build_list_markup(items: Sequence[str], page: int, total_pages: int, scope: 
 def build_user_markup(name: str, scope: str, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⬇️ Скачать .conf", callback_data=f"act:getconf:{name}:{scope}:{page}"),
-            InlineKeyboardButton("🧾 Скачать QR",    callback_data=f"act:getqr:{name}:{scope}:{page}"),
+            InlineKeyboardButton("⬇️ .conf",      callback_data=f"act:getconf:{name}:{scope}:{page}"),
+            InlineKeyboardButton("🧾 QR",          callback_data=f"act:getqr:{name}:{scope}:{page}"),
+            InlineKeyboardButton("📊 Статистика",  callback_data=f"act:stats:{name}:{scope}:{page}"),
         ],
-        [   InlineKeyboardButton("🗑 Удалить",        callback_data=f"act:askrevoke:{name}:{scope}:{page}") ],
-        [   InlineKeyboardButton("← Назад к списку",  callback_data=f"list:{scope}:{page}") ]
+        [   InlineKeyboardButton("🗑 Удалить",     callback_data=f"act:askrevoke:{name}:{scope}:{page}") ],
+        [   InlineKeyboardButton("← Назад к списку", callback_data=f"list:{scope}:{page}") ],
     ])
 
 def build_user_confirm_markup(name: str, scope: str, page: int) -> InlineKeyboardMarkup:
@@ -174,6 +202,18 @@ def build_user_confirm_markup(name: str, scope: str, page: int) -> InlineKeyboar
         ]
     ])
 
+def build_stats_markup(name: str, scope: str, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↻ Обновить", callback_data=f"act:stats:{name}:{scope}:{page}")],
+        [InlineKeyboardButton("← Назад",    callback_data=f"user:{name}:{scope}:{page}")],
+    ])
+
+def build_global_stats_markup(scope: str, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↻ Обновить", callback_data=f"gstats:{scope}:{page}")],
+        [InlineKeyboardButton("← Назад к списку", callback_data=f"list:{scope}:{page}")],
+    ])
+
 def list_title(scope: str, page: int, total: int, total_pages: int) -> str:
     return f"Список клиентов ({'Активные' if scope=='active' else 'Все'}): стр. {page}/{total_pages} • всего: {total}\n" \
            f"Подсказки: /find <маска>, /add <имя>, /revoke <имя>"
@@ -181,11 +221,159 @@ def list_title(scope: str, page: int, total: int, total_pages: int) -> str:
 def ensure_single_message(msg: Message | None) -> bool:
     return msg is not None and msg.message_id is not None
 
+# ---------- wg dump ----------
+async def wg_dump_map() -> Tuple[str, Dict[str, dict]]:
+    """
+    Возвращает (iface, map[pubkey] -> dict(fields)) по `wg show <iface> dump`
+    Поля peer-строки:
+      0 public_key, 1 preshared_key, 2 endpoint, 3 allowed_ips,
+      4 latest_handshake (unix), 5 rx, 6 tx, 7 persistent_keepalive
+    """
+    iface = detect_iface()
+    proc = await run_cmd(["wg", "show", iface, "dump"])
+    peers: Dict[str, dict] = {}
+    if proc.returncode != 0:
+        return iface, peers
+    for line in proc.stdout.strip().splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) == 4:
+            # header/interface line — пропускаем
+            continue
+        if len(parts) >= 8:
+            pub = parts[0]
+            peers[pub] = {
+                "endpoint": parts[2] if parts[2] != "(none)" else "",
+                "allowed_ips": parts[3],
+                "latest_handshake": int(parts[4]) if parts[4].isdigit() else 0,
+                "rx": int(parts[5]) if parts[5].isdigit() else 0,
+                "tx": int(parts[6]) if parts[6].isdigit() else 0,
+                "keepalive": int(parts[7]) if parts[7].isdigit() else 0,
+            }
+    return iface, peers
+
+def map_pub_to_user() -> Dict[str, str]:
+    """Сопоставление public.key -> username по каталогу клиентов."""
+    mapping: Dict[str, str] = {}
+    if not CLIENTS_DIR.exists():
+        return mapping
+    for d in CLIENTS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        name = d.name
+        pub = d / "public.key"
+        if pub.exists():
+            try:
+                key = pub.read_text().strip()
+                if key:
+                    mapping[key] = name
+            except Exception:
+                pass
+    return mapping
+
+# ---------- Текст статистики по клиенту ----------
+async def build_stats_text(username: str) -> str:
+    pub_path = client_pubkey_path(username)
+    conf_path = client_conf_path(username)
+    if not pub_path.exists():
+        return "Нет public.key — возможно, клиент удалён."
+    pubkey = pub_path.read_text().strip()
+
+    iface, dump_map = await wg_dump_map()
+    st = dump_map.get(pubkey, {})
+    now = datetime.now().timestamp()
+
+    # из клиента: Address, AllowedIPs
+    addr = "-"
+    allowed_user = "-"
+    if conf_path.exists():
+        try:
+            for line in conf_path.read_text().splitlines():
+                if line.strip().startswith("Address"):
+                    addr = line.split("=", 1)[1].strip()
+                if line.strip().startswith("AllowedIPs"):
+                    allowed_user = line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+
+    hs = st.get("latest_handshake", 0)
+    if hs:
+        hs_text = f"{fmt_dt(hs)} (≈ {fmt_age(now-hs)} назад)"
+    else:
+        hs_text = "ещё не было"
+
+    rx = st.get("rx", 0)
+    tx = st.get("tx", 0)
+    total = rx + tx
+    keepalive = st.get("keepalive", 0)
+    keepalive_text = f"{keepalive}s" if keepalive else "выкл"
+    endpoint = st.get("endpoint") or "-"
+
+    lines = [
+        f"📊 <b>Статистика: {html.escape(username)}</b>",
+        f"Интерфейс: <code>{iface}</code>",
+        f"Адрес клиента: <code>{html.escape(addr)}</code>",
+        f"Endpoint (последний): <code>{html.escape(endpoint)}</code>",
+        f"Последнее рукопожатие: {hs_text}",
+        f"Трафик: RX {human_bytes(rx)} | TX {human_bytes(tx)} | Σ {human_bytes(total)}",
+        f"Keepalive: {keepalive_text}",
+        f"AllowedIPs (client): <code>{html.escape(allowed_user)}</code>",
+    ]
+    return "\n".join(lines)
+
+# ---------- Общая статистика ----------
+async def build_global_stats_text() -> str:
+    all_clients = list_all_clients_fs()
+    total_clients = len(all_clients)
+
+    iface, dump_map = await wg_dump_map()
+    pub2user = map_pub_to_user()
+    now = datetime.now().timestamp()
+
+    known_peers = {k: v for k, v in dump_map.items() if k in pub2user}
+    peers_count = len(known_peers)
+
+    online_recent = 0
+    rx_total = 0
+    tx_total = 0
+    leaderboard: List[Tuple[str, int, int, int]] = []  # (username_or_key, rx, tx, hs)
+
+    for pub, st in known_peers.items():
+        rx = int(st.get("rx", 0))
+        tx = int(st.get("tx", 0))
+        hs = int(st.get("latest_handshake", 0))
+        if hs and now - hs <= ONLINE_WINDOW:
+            online_recent += 1
+        rx_total += rx
+        tx_total += tx
+        username = pub2user.get(pub, pub[:8])
+        leaderboard.append((username, rx, tx, hs))
+
+    # топ по суммарному трафику
+    leaderboard.sort(key=lambda x: (x[1] + x[2]), reverse=True)
+    top = leaderboard[:10]
+
+    lines = [
+        f"📈 <b>Общая статистика</b>",
+        f"Интерфейс: <code>{iface}</code>",
+        f"Клиентов (всего по папкам): <b>{total_clients}</b>",
+        f"Peers в wg (из известных клиентов): <b>{peers_count}</b>",
+        f"Онлайн (рукопожатие ≤ {ONLINE_WINDOW//60} мин): <b>{online_recent}</b>",
+        f"Σ трафик (известные): RX {human_bytes(rx_total)} | TX {human_bytes(tx_total)} | Σ {human_bytes(rx_total+tx_total)}",
+        "",
+        "<b>Топ-10 по трафику</b>",
+    ]
+    if not top:
+        lines.append("— данных нет —")
+    else:
+        for i, (name, rx, tx, hs) in enumerate(top, 1):
+            age = f"{fmt_age(now-hs)} назад" if hs else "нет рукопожатий"
+            lines.append(f"{i}. {html.escape(name)} — RX {human_bytes(rx)}, TX {human_bytes(tx)}, Σ {human_bytes(rx+tx)}; HS: {age}")
+
+    return "\n".join(lines)
 
 # ---------- Команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        await update.message.reply_text("Доступ запрещён."); return
+    if not is_admin(update): return await update.message.reply_text("Доступ запрещён.")
     await update.message.reply_text(
         "Привет! Я панель управления WireGuard.\n"
         "• /list — список (пагинация)\n"
@@ -194,6 +382,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /revoke <username>\n"
         "• /getconf <username> /getqr <username>\n"
         "• /show <username>\n"
+        "• /stats — общая статистика\n"
     )
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -224,7 +413,6 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     matches = [n for n in all_names if mask in n.lower()]
     if not matches:
         return await update.message.reply_text("Ничего не найдено.")
-    # первые 30 результатов
     matches = matches[:30]
     kb = [[InlineKeyboardButton(n, callback_data=f"user:{n}:all:1")] for n in matches]
     await update.message.reply_text(f"Найдено: {len(matches)}", reply_markup=InlineKeyboardMarkup(kb))
@@ -319,6 +507,10 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text(f"❌ Ошибка:\n<pre>{html.escape(proc.stderr or proc.stdout)}</pre>", parse_mode="HTML")
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update): return await update.message.reply_text("Доступ запрещён.")
+    text = await build_global_stats_text()
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # ---------- Callback (кнопки) ----------
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -351,6 +543,15 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         page = int(page_s) if page_s.isdigit() else 1
         await q.message.edit_text(f"Управление: {name}")
         await q.message.edit_reply_markup(build_user_markup(name, scope, page))
+        return
+
+    # gstats:<scope>:<page> — общая статистика
+    if kind == "gstats":
+        scope, page_s = rest
+        page = int(page_s) if page_s.isdigit() else 1
+        text = await build_global_stats_text()
+        await q.message.edit_text(text, parse_mode="HTML")
+        await q.message.edit_reply_markup(build_global_stats_markup(scope, page))
         return
 
     # act:<action>:<name>:<scope>:<page>
@@ -392,6 +593,11 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await q.message.reply_photo(photo=InputFile(f, filename=qr.name), caption=f"{name} — QR")
             return
 
+        if action == "stats":
+            text = await build_stats_text(name)
+            await q.message.edit_text(text, parse_mode="HTML")
+            await q.message.edit_reply_markup(build_stats_markup(name, scope, page))
+            return
 
 # ---------- Ошибки ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,7 +607,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_chat.send_message("⚠️ Произошла ошибка, проверьте логи на сервере.")
     except Exception:
         pass
-
 
 # ---------- main ----------
 def main():
@@ -418,8 +623,9 @@ def main():
     app.add_handler(CommandHandler("getconf", cmd_getconf))
     app.add_handler(CommandHandler("getqr",   cmd_getqr))
     app.add_handler(CommandHandler("show",    cmd_show))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
 
-    app.add_handler(CallbackQueryHandler(on_cb, pattern=r"^(list|user|act):"))
+    app.add_handler(CallbackQueryHandler(on_cb, pattern=r"^(list|user|act|gstats):"))
 
     app.add_error_handler(on_error)
 
@@ -427,4 +633,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
