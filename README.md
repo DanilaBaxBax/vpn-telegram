@@ -30,7 +30,7 @@
 1) Клонируйте репозиторий и перейдите в него:
 
 ```bash
-git clone https://github.com/<you>/vpn-telegram.git
+git clone https://github.com/DanilaBaxBax/vpn-telegram.git
 cd vpn-telegram
 chmod +x install.sh
 ```
