@@ -155,18 +155,34 @@ ensure_python() {
     log "Installing Python3"
     apt_install python3
   fi
-  if ! python3 -m venv -h >/dev/null 2>&1; then
-    log "Installing python3-venv and pip"
-    apt_install python3-venv python3-pip
+  # base venv and pip packages (meta)
+  if ! dpkg -s python3-venv >/dev/null 2>&1; then
+    log "Installing python3-venv and python3-pip"
+    apt_install python3-venv python3-pip || true
   fi
 }
 
 ensure_venv() {
   ensure_python
+
   if [[ ! -d "$VENV_DIR" ]]; then
     log "Creating venv at $VENV_DIR"
-    python3 -m venv "$VENV_DIR"
+    if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
+      warn "python3 -m venv failed — trying to install version-specific venv package"
+      PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")') || PYVER=""
+      if [[ -n "$PYVER" ]]; then
+        # try version-specific package (ignore failure if package name doesn't exist)
+        apt-get install -y "python3.$PYVER-venv" || true
+      fi
+      # retry
+      if ! python3 -m venv "$VENV_DIR" 2>/tmp/venv.err; then
+        echo "----------- venv creation error -----------" >&2
+        cat /tmp/venv.err >&2 || true
+        err "Failed to create venv. Ensure python3-venv (and python3.<ver>-venv) is installed."
+      fi
+    fi
   fi
+
   VENV_PY="$VENV_DIR/bin/python"
   log "Upgrading pip and installing python-telegram-bot==20.7"
   "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
@@ -331,4 +347,3 @@ main() {
 }
 
 main "$@"
-
