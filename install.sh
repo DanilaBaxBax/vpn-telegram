@@ -184,9 +184,9 @@ ensure_venv() {
   fi
 
   VENV_PY="$VENV_DIR/bin/python"
-  log "Upgrading pip and installing python-telegram-bot==20.7"
+  log "Upgrading pip and installing python-telegram-bot[job-queue]==20.7"
   "$VENV_DIR/bin/pip" install --upgrade pip >/dev/null
-  "$VENV_DIR/bin/pip" install "python-telegram-bot==20.7" >/dev/null
+  "$VENV_DIR/bin/pip" install "python-telegram-bot[job-queue]==20.7" >/dev/null
 }
 
 ensure_dirs() {
@@ -297,6 +297,79 @@ enable_start_unit() {
   log "Enabled and started: $unit"
 }
 
+## -------- Post-install checks --------
+post_install_checks() {
+  echo
+  log "Post-install checks"
+
+  # Server status
+  if command -v wg >/dev/null 2>&1; then
+    if systemctl is-active --quiet "wg-quick@${IFACE}"; then
+      log "WireGuard: wg-quick@${IFACE} is active"
+    else
+      warn "WireGuard: wg-quick@${IFACE} is not active (try: systemctl status wg-quick@${IFACE})"
+    fi
+  else
+    warn "WireGuard not found in PATH (wg). If server not installed, ignore."
+  fi
+
+  # Env values (tokens)
+  local adm_token="" usr_token=""
+  [[ -f "$ADMIN_ENV_FILE" ]] && adm_token="$(grep -E '^BOT_TOKEN=' "$ADMIN_ENV_FILE" | sed 's/^[^=]*=//')"
+  [[ -f "$USER_ENV_FILE"  ]] && usr_token="$(grep -E '^BOT_TOKEN=' "$USER_ENV_FILE"  | sed 's/^[^=]*=//')"
+
+  # Admin bot service
+  if [[ -f "$ADMIN_SERVICE" ]]; then
+    if systemctl is-active --quiet "$(basename "$ADMIN_SERVICE")"; then
+      log "Admin bot: service is active"
+    else
+      warn "Admin bot: service is not active (try: systemctl status vpn-admin-bot)"
+    fi
+    if [[ -z "${adm_token}" ]]; then
+      warn "Admin bot: BOT_TOKEN is empty in $ADMIN_ENV_FILE"
+    fi
+  fi
+
+  # User bot service
+  if [[ -f "$USER_SERVICE" ]]; then
+    if systemctl is-active --quiet "$(basename "$USER_SERVICE")"; then
+      log "User bot: service is active"
+    else
+      warn "User bot: service is not active (try: systemctl status vpn-user-bot)"
+    fi
+    if [[ -z "${usr_token}" ]]; then
+      warn "User bot: BOT_TOKEN is empty in $USER_ENV_FILE"
+    fi
+  fi
+
+  # Job-Queue availability in venv
+  if [[ -x "$VENV_DIR/bin/python" ]]; then
+    local jq_check
+    jq_check="$("$VENV_DIR/bin/python" - <<'PY' 2>/dev/null
+try:
+    import apscheduler  # provided by python-telegram-bot[job-queue]
+    ok = True
+except Exception:
+    ok = False
+print('OK' if ok else 'MISSING')
+PY
+)"
+    if [[ "$jq_check" == "OK" ]]; then
+      log "JobQueue deps: present (apscheduler)"
+    else
+      warn "JobQueue deps: missing. Install with: $VENV_DIR/bin/pip install 'python-telegram-bot[job-queue]==20.7'"
+    fi
+  else
+    warn "Python venv missing at $VENV_DIR"
+  fi
+
+  echo
+  echo "Next steps:"
+  echo "  - Check services: systemctl status vpn-admin-bot vpn-user-bot --no-pager"
+  echo "  - See logs:      journalctl -u vpn-admin-bot -u vpn-user-bot -n 50 --no-pager"
+  echo "  - Server status:  systemctl status wg-quick@${IFACE} --no-pager; wg show ${IFACE} || true"
+}
+
 ## -------- Main --------
 main() {
   parse_args "$@"
@@ -342,6 +415,9 @@ main() {
   if [[ $DO_USER -eq 1 ]]; then
     echo "  User bot:      env=$USER_ENV_FILE unit=$USER_SERVICE"
   fi
+
+  post_install_checks || true
+
   echo
   log "Done."
 }

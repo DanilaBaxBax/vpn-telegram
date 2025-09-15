@@ -567,8 +567,12 @@ def main():
     app.add_handler(CommandHandler("delpromo",   cmd_delpromo))
     app.add_handler(CommandHandler("promoinfo",  cmd_promoinfo))
 
-    # expiry job
-    app.job_queue.run_repeating(job_expiry_check, interval=ONLINE_REVOKE_INTERVAL, first=30)
+    # expiry job (optional JobQueue)
+    jq = getattr(app, "job_queue", None)
+    if jq is not None:
+        jq.run_repeating(job_expiry_check, interval=ONLINE_REVOKE_INTERVAL, first=30)
+    else:
+        log.warning("JobQueue unavailable. Install python-telegram-bot[job-queue] to enable expiry checks.")
 
     app.run_polling()
 

@@ -93,7 +93,7 @@ apt-get update -y && apt-get install -y python3-venv python3-pip
 python3 -m venv /opt/vpn-bot/.venv
 source /opt/vpn-bot/.venv/bin/activate
 pip install --upgrade pip
-pip install python-telegram-bot==20.7
+pip install "python-telegram-bot[job-queue]==20.7"
 
 # Запуск (важно: бот должен уметь вызывать /root/vpn_setup.sh с правами root)
 export BOT_TOKEN=XXX:YYYY
@@ -105,7 +105,7 @@ sudo -E /opt/vpn-bot/.venv/bin/python admin-bot/vpn_bot_admin.py
 
 ```bash
 source /opt/vpn-bot/.venv/bin/activate
-pip install python-telegram-bot==20.7
+pip install "python-telegram-bot[job-queue]==20.7"
 
 export BOT_TOKEN=XXX:YYYY
 # (опц.) онлайн‑оплата через Telegram Payments
