@@ -23,6 +23,54 @@
 └── readme.txt                   # краткие заметки по серверному скрипту
 ```
 
+## Установка через install.sh
+
+Скрипт автоматизирует установку сервера, подготовку окружения Python и развёртывание обоих ботов с systemd.
+
+1) Клонируйте репозиторий и перейдите в него:
+
+```bash
+git clone https://github.com/<you>/vpn-telegram.git
+cd vpn-telegram
+chmod +x install.sh
+```
+
+2) Запустите установку (пример — полный набор: сервер + админ‑бот + пользовательский бот):
+
+```bash
+sudo ./install.sh --all \
+  --admin-bot-token AA:BB --admin-ids 123456789 \
+  --user-bot-token CC:DD --pay-test-zero 1 \
+  --port 51820 --subnet 10.8.0.0/24 --dns 1.1.1.1,9.9.9.9
+```
+
+Другие примеры:
+
+```bash
+# Только сервер и админ-бот
+sudo ./install.sh --server --admin-bot --admin-bot-token AA:BB
+
+# Только пользовательский бот (если сервер уже установлен)
+sudo ./install.sh --user-bot --user-bot-token CC:DD --pay-test-zero 1
+```
+
+Полный список флагов: `./install.sh --help`.
+
+Что делает скрипт:
+
+- Устанавливает зависимости WireGuard (apt), копирует `server-part/vpn_conf.sh` в `/root/vpn_setup.sh` и запускает установку (`install`).
+- Создаёт Python venv (по умолчанию `/opt/vpn-bot/.venv`) и ставит `python-telegram-bot==20.7`.
+- Создаёт env‑файлы `/etc/vpn-telegram/admin-bot.env` и `/etc/vpn-telegram/user-bot.env` из переданных параметров.
+- Создаёт и включает systemd‑сервисы `vpn-admin-bot.service` и `vpn-user-bot.service` (если заданы токены ботов).
+
+Полезные флаги:
+
+- `--iface`, `--port`, `--subnet`, `--dns` — параметры WireGuard при установке сервера.
+- `--admin-bot-token`, `--admin-ids` — токен и список chat_id для админ‑бота.
+- `--user-bot-token`, `--payment-provider-token`, `--currency`, `--pay-test-zero` — параметры пользовательского бота и платежей.
+- `--venv-dir` — путь к виртуальному окружению Python (по умолчанию `/opt/vpn-bot/.venv`).
+- `--no-start` — не запускать сервисы после установки (создаст только файлы и юниты).
+
 ## Быстрый старт
 
 1) Установка WireGuard сервера (root):
