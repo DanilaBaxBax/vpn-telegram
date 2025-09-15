@@ -293,8 +293,14 @@ reload_systemd() { systemctl daemon-reload; }
 
 enable_start_unit() {
   local unit="$1"
-  systemctl enable --now "$unit"
-  log "Enabled and started: $unit"
+  systemctl enable "$unit" >/dev/null 2>&1 || true
+  if systemctl is-active --quiet "$unit"; then
+    systemctl restart "$unit"
+    log "Restarted (and enabled): $unit"
+  else
+    systemctl start "$unit"
+    log "Started (and enabled): $unit"
+  fi
 }
 
 ## -------- Post-install checks --------
