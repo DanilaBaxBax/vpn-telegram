@@ -14,6 +14,7 @@ err()  { echo -e "[\e[31mERR\e[0m] $*"; exit 1; }
 DO_SERVER=0
 DO_ADMIN=0
 DO_USER=0
+DO_SUPPORT=0
 START_SERVICES=1
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,13 +37,20 @@ PAYMENT_PROVIDER_TOKEN=""
 CURRENCY="RUB"
 PAY_TEST_ZERO="1"
 
+# Support bot
+SUPPORT_BOT_TOKEN=""
+SUPPORT_ADMIN_IDS=""
+SUPPORT_NOTIFY_TARGET="@baxbax_VPN_support"
+
 # Paths and files
 SETUP_DST="/root/vpn_setup.sh"
 ENV_DIR="/etc/vpn-telegram"
 ADMIN_ENV_FILE="$ENV_DIR/admin-bot.env"
 USER_ENV_FILE="$ENV_DIR/user-bot.env"
+SUPPORT_ENV_FILE="$ENV_DIR/support-bot.env"
 ADMIN_SERVICE="/etc/systemd/system/vpn-admin-bot.service"
 USER_SERVICE="/etc/systemd/system/vpn-user-bot.service"
+SUPPORT_SERVICE="/etc/systemd/system/vpn-support-bot.service"
 USER_DB_DIR="/var/lib/vpn-user-bot"
 
 ## -------- Usage --------
@@ -55,6 +63,7 @@ Select components:
   --server                  Install WireGuard server via vpn_setup.sh
   --admin-bot               Install and configure admin Telegram bot
   --user-bot                Install and configure user Telegram bot
+  --support-bot             Install and configure support Telegram bot
 
 WireGuard options (when --server):
   --iface NAME              Interface name (default: wg0)
@@ -71,6 +80,11 @@ User bot options (when --user-bot):
   --payment-provider-token TOKEN  Telegram Payments provider token (optional)
   --currency CODE           Payment currency (default: RUB)
   --pay-test-zero 0|1       Test invoices for 0 (default: 1)
+
+Support bot options (when --support-bot):
+  --support-bot-token TOKEN       Telegram bot token (required to start)
+  --support-admin-ids CSV         CSV of support agent chat IDs (optional)
+  --support-notify-target TARGET  @channel or chat id for new ticket notifications (optional)
 
 Common options:
   --venv-dir PATH           Python venv path (default: /opt/vpn-bot/.venv)
@@ -98,6 +112,7 @@ parse_args() {
       --server)     DO_SERVER=1; shift;;
       --admin-bot)  DO_ADMIN=1; shift;;
       --user-bot)   DO_USER=1; shift;;
+      --support-bot) DO_SUPPORT=1; shift;;
 
       --iface)      IFACE="${2:?}"; shift 2;;
       --port)       PORT="${2:?}"; shift 2;;
@@ -111,6 +126,10 @@ parse_args() {
       --payment-provider-token) PAYMENT_PROVIDER_TOKEN="${2:?}"; shift 2;;
       --currency)             CURRENCY="${2:?}"; shift 2;;
       --pay-test-zero)        PAY_TEST_ZERO="${2:?}"; shift 2;;
+
+      --support-bot-token)    SUPPORT_BOT_TOKEN="${2:?}"; shift 2;;
+      --support-admin-ids)    SUPPORT_ADMIN_IDS="${2:?}"; shift 2;;
+      --support-notify-target) SUPPORT_NOTIFY_TARGET="${2:?}"; shift 2;;
 
       --venv-dir)    VENV_DIR="${2:?}"; shift 2;;
       --repo-dir)    REPO_DIR="${2:?}"; shift 2;;
@@ -217,6 +236,7 @@ write_admin_env() {
 BOT_TOKEN=$ADMIN_BOT_TOKEN
 ADMIN_IDS=$ADMIN_IDS
 BASH=/bin/bash
+SUPPORT_CONTACT_LINK=https://t.me/baxbax_VPN_support
 ENV
   chmod 600 "$ADMIN_ENV_FILE"
   log "Wrote $ADMIN_ENV_FILE"
@@ -288,6 +308,42 @@ UNIT
   log "Wrote $USER_SERVICE"
 }
 
+## -------- Support bot --------
+write_support_env() {
+  cat >"$SUPPORT_ENV_FILE" <<ENV
+BOT_TOKEN=$SUPPORT_BOT_TOKEN
+ADMIN_IDS=$SUPPORT_ADMIN_IDS
+SUPPORT_NOTIFY_TARGET=$SUPPORT_NOTIFY_TARGET
+ENV
+  chmod 600 "$SUPPORT_ENV_FILE"
+  log "Wrote $SUPPORT_ENV_FILE"
+}
+
+install_support_bot() {
+  ensure_venv
+  ensure_dirs
+  write_support_env
+
+  cat >"$SUPPORT_SERVICE" <<UNIT
+[Unit]
+Description=VPN Support Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+WorkingDirectory=$REPO_DIR
+EnvironmentFile=$SUPPORT_ENV_FILE
+ExecStart=$VENV_DIR/bin/python $REPO_DIR/support-bot/vpn_bot_support.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  log "Wrote $SUPPORT_SERVICE"
+}
+
 ## -------- Enable/start --------
 reload_systemd() { systemctl daemon-reload; }
 
@@ -348,6 +404,22 @@ post_install_checks() {
     fi
   fi
 
+  # Support bot service
+  if [[ -f "$SUPPORT_SERVICE" ]]; then
+    if systemctl is-active --quiet "$(basename "$SUPPORT_SERVICE")"; then
+      log "Support bot: service is active"
+    else
+      warn "Support bot: service is not active (try: systemctl status vpn-support-bot)"
+    fi
+    if [[ -f "$SUPPORT_ENV_FILE" ]]; then
+      local sup_token
+      sup_token="$(grep -E '^BOT_TOKEN=' "$SUPPORT_ENV_FILE" | sed 's/^[^=]*=//')"
+      if [[ -z "$sup_token" ]]; then
+        warn "Support bot: BOT_TOKEN is empty in $SUPPORT_ENV_FILE"
+      fi
+    fi
+  fi
+
   # Job-Queue availability in venv
   if [[ -x "$VENV_DIR/bin/python" ]]; then
     local jq_check
@@ -399,11 +471,19 @@ main() {
     install_user_bot
   fi
 
+  if [[ $DO_SUPPORT -eq 1 ]]; then
+    if [[ -z "$SUPPORT_BOT_TOKEN" ]]; then
+      warn "--support-bot selected but --support-bot-token is empty. Service will be installed but not started."
+    fi
+    install_support_bot
+  fi
+
   reload_systemd
 
   if [[ $START_SERVICES -eq 1 ]]; then
     [[ $DO_ADMIN -eq 1 && -n "$ADMIN_BOT_TOKEN" ]] && enable_start_unit "$(basename "$ADMIN_SERVICE")" || true
     [[ $DO_USER  -eq 1 && -n "$USER_BOT_TOKEN"  ]] && enable_start_unit "$(basename "$USER_SERVICE")" || true
+    [[ $DO_SUPPORT -eq 1 && -n "$SUPPORT_BOT_TOKEN" ]] && enable_start_unit "$(basename "$SUPPORT_SERVICE")" || true
   else
     warn "--no-start specified — services were not enabled/started"
   fi
@@ -420,6 +500,9 @@ main() {
   fi
   if [[ $DO_USER -eq 1 ]]; then
     echo "  User bot:      env=$USER_ENV_FILE unit=$USER_SERVICE"
+  fi
+  if [[ $DO_SUPPORT -eq 1 ]]; then
+    echo "  Support bot:   env=$SUPPORT_ENV_FILE unit=$SUPPORT_SERVICE"
   fi
 
   post_install_checks || true

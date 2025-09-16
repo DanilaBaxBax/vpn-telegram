@@ -18,6 +18,8 @@
 │   └── vpn_bot_admin.py         # админ-бот Telegram
 ├── user-bot/
 │   └── vpn_bot_user.py          # пользовательский бот Telegram
+├── support-bot/
+│   └── vpn_bot_support.py       # саппорт-бот (тикеты)
 ├── README.md
 ├── LICENSE
 └── readme.txt                   # краткие заметки по серверному скрипту
@@ -35,12 +37,13 @@ cd vpn-telegram
 chmod +x install.sh
 ```
 
-2) Запустите установку (пример — полный набор: сервер + админ‑бот + пользовательский бот):
+2) Запустите установку (пример — полный набор: сервер + админ‑бот + пользовательский бот + саппорт‑бот):
 
 ```bash
 sudo ./install.sh --all \
   --admin-bot-token AA:BB --admin-ids 123456789 \
   --user-bot-token CC:DD --pay-test-zero 1 \
+  --support-bot-token EE:FF --support-admin-ids 123456789 --support-notify-target @baxbax_VPN_support \
   --port 51820 --subnet 10.8.0.0/24 --dns 1.1.1.1,9.9.9.9
 ```
 
@@ -68,6 +71,7 @@ sudo ./install.sh --user-bot --user-bot-token CC:DD --pay-test-zero 1
 - `--iface`, `--port`, `--subnet`, `--dns` — параметры WireGuard при установке сервера.
 - `--admin-bot-token`, `--admin-ids` — токен и список chat_id для админ‑бота.
 - `--user-bot-token`, `--payment-provider-token`, `--currency`, `--pay-test-zero` — параметры пользовательского бота и платежей.
+- `--support-bot-token`, `--support-admin-ids`, `--support-notify-target` — параметры саппорт‑бота.
 - `--venv-dir` — путь к виртуальному окружению Python (по умолчанию `/opt/vpn-bot/.venv`).
 - `--no-start` — не запускать сервисы после установки (создаст только файлы и юниты).
 
@@ -263,6 +267,28 @@ systemctl enable --now vpn-user-bot.service
 - «Нет QR»: убедитесь, что установлен `qrencode` (ставится автоматически при `install`).
 - «Порт закрыт»: проверьте UFW/файрвол и откройте UDP‑порт, указанный при установке.
 - «Права доступа»: боты должны запускаться с root (или иметь право безпарольного `sudo` для запуска `/root/vpn_setup.sh`).
+
+## Саппорт‑бот (`support-bot/vpn_bot_support.py`)
+
+Назначение: приём тикетов от пользователей и ответы саппорта в личке.
+
+Пользователю:
+- Написать боту сообщение или `/new <текст>` → создаётся тикет, далее переписка идёт в этом чате.
+- `/mytickets` — список последних тикетов.
+
+Саппорту (нужно указать `ADMIN_IDS` в окружении):
+- `/tickets [open|all] [page]` — список.
+- `/view <id>` — карточка и последние сообщения.
+- `/reply <id> <текст>` — ответ пользователю.
+- `/close <id>` — закрыть тикет.
+- Инлайн‑кнопки в уведомлениях: Ответить / Закрыть.
+
+Переменные окружения:
+- `BOT_TOKEN` — токен саппорт‑бота.
+- `ADMIN_IDS` — список chat_id саппорт‑агентов (через запятую).
+- `SUPPORT_NOTIFY_TARGET` — `@username` канала/группы для уведомлений (опционально).
+
+Контакт саппорта по умолчанию: https://t.me/baxbax_VPN_support
 
 ## Лицензия
 

@@ -34,6 +34,7 @@ from datetime import datetime
 from glob import glob
 from pathlib import Path
 from typing import Iterable, List, Sequence, Set, Tuple, Optional, Dict
+import sqlite3
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
@@ -41,6 +42,7 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler,
 )
+from telegram.error import BadRequest
 
 # ---------- Настройки ----------
 VPN_SCRIPT = Path("/root/vpn_setup.sh")  # если другой файл — сделай симлинк на это имя
@@ -51,6 +53,10 @@ BOT_TOKEN = os.environ.get(
     "BOT_TOKEN",
     "Your_Token"  # ENV имеет приоритет
 ).strip()
+SUPPORT_CONTACT_LINK = os.environ.get(
+    "SUPPORT_CONTACT_LINK",
+    "https://t.me/baxbax_VPN_support"
+).strip()
 
 # ограничение доступа (опционально): ADMIN_IDS="123,456"
 _ADMIN_ENV = os.environ.get("ADMIN_IDS", "").strip()
@@ -59,6 +65,9 @@ ADMIN_IDS = {int(x) for x in _ADMIN_ENV.split(",") if x.strip().isdigit()} if _A
 PAGE_SIZE = 12
 ONLINE_WINDOW = 300  # секунд, считаем «онлайн», если рукопожатие было <= 5 мин назад
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+
+# Путь к БД пользовательского бота (если он установлен на той же машине)
+USER_DB_PATH = Path("/var/lib/vpn-user-bot/db.sqlite3")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("vpn-bot")
@@ -201,6 +210,43 @@ def build_user_confirm_markup(name: str, scope: str, page: int) -> InlineKeyboar
             InlineKeyboardButton("✖️ Отмена",      callback_data=f"user:{name}:{scope}:{page}"),
         ]
     ])
+
+async def notify_user_revoked_if_possible(username: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Если имя похоже на u<tg_id>, отметить подписки как 'canceled' в БД user‑бота
+    и попытаться отправить пользователю уведомление.
+    Ошибки не пробрасываем (чтобы UI не показывал общую ошибку).
+    """
+    m = re.fullmatch(r"u(\d+)", username)
+    if not m:
+        return
+    try:
+        tg_id = int(m.group(1))
+    except Exception:
+        return
+
+    # Обновление БД: пометить активные как canceled
+    try:
+        if USER_DB_PATH.exists():
+            con = sqlite3.connect(str(USER_DB_PATH))
+            with con:
+                con.execute("UPDATE subscriptions SET status='canceled' WHERE tg_id=? AND status='active'", (tg_id,))
+            con.close()
+    except Exception as e:
+        log.warning("Failed to mark subscriptions canceled for tg_id=%s: %s", tg_id, e)
+
+    # Уведомление пользователя (если он писал этому боту)
+    try:
+        await context.bot.send_message(
+            chat_id=tg_id,
+            text=(
+                "Ваш доступ к VPN был отозван администратором.\n"
+                f"Если вы считаете это ошибкой, напишите в саппорт: {SUPPORT_CONTACT_LINK}"
+            ),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        # user мог не начинать чат с админ‑ботом — это нормально
+        log.info("Could not DM user %s about revoke (ignored): %s", tg_id, e)
 
 def build_stats_markup(name: str, scope: str, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -462,6 +508,10 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     proc = await run_script(["revoke", username])  # по умолчанию: purge
     if proc.returncode == 0:
         await update.message.reply_text(f"🗑 {username} удалён.")
+        try:
+            await notify_user_revoked_if_possible(username, context)
+        except Exception as e:
+            log.warning("notify_user_revoked failed (cmd) for %s: %s", username, e)
     else:
         await update.message.reply_text(f"❌ Ошибка:\n<pre>{html.escape(proc.stderr or proc.stdout)}</pre>", parse_mode="HTML")
 
@@ -567,10 +617,26 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if action == "revoke":
             proc = await run_script(["revoke", name])
             if proc.returncode == 0:
-                await q.message.edit_text(f"🗑 {name} удалён.")
-                await q.message.edit_reply_markup(None)
+                # Обновить сообщение, не аварийничая на несущественных ошибках
+                try:
+                    await q.message.edit_text(f"🗑 {name} удалён.")
+                except Exception as e:
+                    log.debug("edit_text after revoke ignored: %s", e)
+                try:
+                    await q.message.edit_reply_markup(None)
+                except Exception as e:
+                    log.debug("edit_reply_markup after revoke ignored: %s", e)
+
+                # Попробовать синхронизировать БД пользовательского бота и уведомить пользователя
+                try:
+                    await notify_user_revoked_if_possible(name, context)
+                except Exception as e:
+                    log.warning("notify_user_revoked failed for %s: %s", name, e)
             else:
-                await q.message.reply_text(f"❌ Ошибка удаления:\n<pre>{html.escape(proc.stderr or proc.stdout)}</pre>", parse_mode="HTML")
+                await q.message.reply_text(
+                    f"❌ Ошибка удаления:\n<pre>{html.escape(proc.stderr or proc.stdout)}</pre>",
+                    parse_mode="HTML",
+                )
             return
 
         if action == "getconf":
@@ -601,10 +667,17 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- Ошибки ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Exception in handler", exc_info=context.error)
+    err = context.error
+    # Игнорируем шумные/безопасные ошибки редактирования сообщений
+    if isinstance(err, BadRequest):
+        msg = str(err).lower()
+        if "message is not modified" in msg or "query is too old" in msg:
+            log.debug("Ignored BadRequest: %s", err)
+            return
+    log.exception("Exception in handler", exc_info=err)
     try:
         if isinstance(update, Update) and update.effective_chat:
-            await update.effective_chat.send_message("⚠️ Произошла ошибка, проверьте логи на сервере.")
+            await update.effective_chat.send_message("⚠️ Произошла ошибка. Пожалуйста, повторите действие позже.")
     except Exception:
         pass
 
